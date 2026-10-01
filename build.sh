@@ -21,10 +21,19 @@ apk add --no-cache -q alpine-sdk doas
 adduser -D -G abuild builder
 echo 'permit nopass :abuild' > /etc/doas.d/abuild.conf
 
-mkdir -p /home/builder/ap
-wget -q -O /tmp/aport.tar.gz \
-	"https://gitlab.alpinelinux.org/alpine/aports/-/archive/$commit/aports-$commit.tar.gz?path=main/mesa"
-tar -xzf /tmp/aport.tar.gz -C /home/builder/ap --strip-components=2
+# From GitHub's mirror of aports, which is the one the runners can reach, and
+# only the one directory of it.
+mkdir -p /home/builder/ap /tmp/aports
+(
+	cd /tmp/aports
+	git init -q
+	git remote add origin https://github.com/alpinelinux/aports
+	git sparse-checkout set main/mesa
+	git fetch -q --depth 1 --filter=blob:none origin "$commit"
+	git checkout -q FETCH_HEAD
+	[ "$(git rev-parse HEAD)" = "$commit" ]
+)
+cp -r /tmp/aports/main/mesa /home/builder/ap/mesa
 version=$(/src/patch.sh /home/builder/ap/mesa/APKBUILD)
 echo "building mesa $version from aports $commit"
 chown -R builder:abuild /home/builder/ap

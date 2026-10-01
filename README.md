@@ -21,8 +21,9 @@ step. Each night [`nightly.yml`](.github/workflows/nightly.yml):
 
 1. reads the last commit to `main/mesa` on Alpine's `3.24-stable`, and stops if
    the published packages were built from it;
-2. fetches the aport at that commit and runs [`patch.sh`](patch.sh) over it:
-   `virgl` added to `_gallium_drivers`, and `pkgrel` raised by 100, so that
+2. fetches the aport at that commit, from GitHub's mirror of aports, and
+   runs [`patch.sh`](patch.sh) over it: `virgl` added to
+   `_gallium_drivers`, and `pkgrel` raised by 100, so that
    `26.1.6-r100` is preferred to Alpine's `26.1.6-r0` and to any rebuild of it;
 3. builds it for x86_64 and aarch64 in an `alpine:3.24` container, on native
    runners ([`build.sh`](build.sh));
