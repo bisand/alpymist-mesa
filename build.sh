@@ -17,7 +17,9 @@ set -eu
 commit=${1:?usage: build.sh COMMIT OUT}
 out=${2:?usage: build.sh COMMIT OUT}
 
-apk add --no-cache -q alpine-sdk doas
+# With the index kept: abuild installs what the aport needs to build from it.
+apk update -q
+apk add -q alpine-sdk doas
 adduser -D -G abuild builder
 echo 'permit nopass :abuild' > /etc/doas.d/abuild.conf
 
