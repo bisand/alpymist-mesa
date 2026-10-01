@@ -1,0 +1,175 @@
+name: Nightly
+
+# Follows Alpine's mesa. Each night: read Alpine's aport on the stable branch,
+# and if it is not the one the published packages were built from, build it
+# with virgl added for x86_64 and aarch64, sign the index and publish.
+#
+# The build jobs run Alpine's APKBUILD and Mesa's own build, and hold no
+# secret. Only the publish job has the guest key, from the guest-channel
+# environment, which only main may deploy to.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build and publish even if Alpine's mesa has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Has Alpine's mesa changed?
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # To keep the schedule alive; see the last step.
+      actions: write
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+      commit: ${{ steps.alpine.outputs.commit }}
+      version: ${{ steps.alpine.outputs.version }}
+      image: ${{ steps.alpine.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What Alpine has
+        id: alpine
+        run: |
+          . ./release.conf
+          api=https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports
+          commit=$(curl -fsS --retry 3 \
+            "$api/repository/commits?path=main/mesa&ref_name=$APORTS_BRANCH&per_page=1" \
+            | jq -er '.[0].id')
+          curl -fsS --retry 3 -o APKBUILD \
+            "https://gitlab.alpinelinux.org/alpine/aports/-/raw/$commit/main/mesa/APKBUILD"
+          # Fails the run, loudly, when Alpine builds virgl itself or the file
+          # has changed shape.
+          version=$(./patch.sh APKBUILD)
+          echo "Alpine's main/mesa on $APORTS_BRANCH is at $commit; this builds $version"
+          {
+            echo "commit=$commit"
+            echo "version=$version"
+            echo "image=alpine:${BRANCH#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: What is published
+        id: compare
+        env:
+          WANT: ${{ steps.alpine.outputs.version }} ${{ steps.alpine.outputs.commit }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          . ./release.conf
+          have=""
+          if git fetch -q --depth 1 origin gh-pages 2>/dev/null; then
+            have=$(git show "FETCH_HEAD:$BRANCH/VERSION" 2>/dev/null || true)
+          fi
+          echo "published: ${have:-nothing}"
+          echo "wanted:    $WANT"
+          if [ "$have" = "$WANT" ] && [ "$FORCE" != true ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GitHub stops a schedule in a repository nobody has touched for sixty
+      # days, and Alpine's stable mesa can go longer than that without a
+      # change. Enabling the workflow again counts as touching it.
+      - name: Keep the schedule
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/nightly.yml/enable"
+
+  build:
+    name: Mesa (${{ matrix.arch }})
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          # Native, not emulated.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        env:
+          COMMIT: ${{ needs.check.outputs.commit }}
+          IMAGE: ${{ needs.check.outputs.image }}
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/out":/out "$IMAGE" \
+            /src/build.sh "$COMMIT" /out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.arch }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Sign and publish
+    needs: [check, build]
+    # A run of another branch builds, to try a change, and publishes nothing.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment:
+      name: guest-channel
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: packages
+
+      - name: Sign the index
+        env:
+          GUEST_CHANNEL_SIGNING_KEY: ${{ secrets.GUEST_CHANNEL_SIGNING_KEY }}
+          VERSION: ${{ needs.check.outputs.version }}
+          COMMIT: ${{ needs.check.outputs.commit }}
+          IMAGE: ${{ needs.check.outputs.image }}
+          DOMAIN: ${{ vars.DOMAIN }}
+        run: |
+          . ./release.conf
+          umask 077
+          mkdir key site
+          printf '%s\n' "$GUEST_CHANNEL_SIGNING_KEY" > "key/$KEY_NAME"
+          docker run --rm -e DOMAIN -v "$PWD":/src:ro -v "$PWD/packages":/packages:ro \
+            -v "$PWD/key":/key:ro -v "$PWD/site":/site "$IMAGE" \
+            /src/publish.sh /packages /site "/key/$KEY_NAME" "$VERSION" "$COMMIT"
+          rm -rf key
+          sudo chown -R "$(id -u):$(id -g)" site
+          chmod -R u+rwX,go+rX site
+
+      # One commit, replacing the last: the site is the packages of one
+      # version, and their history is this repository's runs.
+      - name: Publish
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          COMMIT: ${{ needs.check.outputs.commit }}
+        run: |
+          cd site
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "mesa $VERSION, from Alpine aports $COMMIT (run $GITHUB_RUN_NUMBER)"
+          git push -q --force \
+            "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" gh-pages
